@@ -403,9 +403,10 @@ void AnyLink::connectVPN(bool reconnect)
             if(result.isObject()) {  // error object
                 // dialog
                 //                ui->statusBar->setText(result.toObject().value("message").toString());
-                if (reconnect) {
+                 //tery reconnect to true 3000 to 5000
+                if (true) {
                     // 当快速重连失败，再次尝试完全重新连接，用于服务端可能已经移除session的情况
-                    QTimer::singleShot(3000, this, [this]() { connectVPN(); });
+                    QTimer::singleShot(5000, this, [this]() { connectVPN(); });
                 } else {
                     if (isHidden()) {
                         show();
