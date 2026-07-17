@@ -376,6 +376,7 @@ jobs:
       # 步骤7: 删除上游 Actions（只保留本地 workflow）
       # ============================================
       - name: 🚫 删除上游 Actions
+        id: remove_actions
         if: github.event.inputs.disable_upstream_actions != 'false'
         continue-on-error: true
         env:
@@ -419,6 +420,11 @@ jobs:
             echo "⚠️ .github/workflows 目录不存在"
           fi
 
+          # 输出删除 workflow 后的 HEAD SHA，作为 tag 目标（避免 tag 指向含 workflow 的旧 commit）
+          POST_REMOVE_SHA=$(git rev-parse HEAD)
+          echo "📌 删除 workflow 后的 HEAD SHA: $POST_REMOVE_SHA"
+          echo "tag_target_sha=$POST_REMOVE_SHA" >> $GITHUB_OUTPUT
+
           # 2. 清理 Actions 历史运行记录（非 sync-upstream 的）
           echo ""
           echo "🧹 清理 Actions 历史运行记录..."
@@ -427,11 +433,17 @@ jobs:
           # 获取所有 workflow 列表
           WORKFLOWS=$(gh api "/repos/$CURRENT_REPO/actions/workflows" --paginate 2>/dev/null | jq -c '.workflows[]' 2>/dev/null) || {
             echo "⚠️ 无法获取 workflow 列表，跳过清理"
+            # 仍然输出 tag_target_sha（即使跳过清理）
+            POST_REMOVE_SHA=$(git rev-parse HEAD)
+            echo "tag_target_sha=$POST_REMOVE_SHA" >> $GITHUB_OUTPUT
             exit 0
           }
 
           if [ -z "$WORKFLOWS" ]; then
             echo "   没有需要清理的 workflow"
+            # 仍然输出 tag_target_sha（即使无需清理）
+            POST_REMOVE_SHA=$(git rev-parse HEAD)
+            echo "tag_target_sha=$POST_REMOVE_SHA" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -556,8 +568,10 @@ jobs:
           SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
           CURRENT_REPO="${{ github.repository }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
-          # 使用当前 HEAD（已恢复本地 workflows），而非上游 commit SHA
-          TARGET_SHA="${{ steps.code_sync.outputs.tag_target_sha || steps.get_head_sha.outputs.tag_target_sha || steps.get_sha.outputs.commit_sha }}"
+          # 优先使用步骤7（删除上游 workflow 后）的 HEAD SHA 作为 tag 目标
+          # 这样 tag 指向的 commit 不含上游 workflow，避免 push 时触发 workflows 权限检查
+          # 兜底顺序：步骤7 > 步骤6.5 > 步骤6.6 > 步骤6
+          TARGET_SHA="${{ steps.remove_actions.outputs.tag_target_sha || steps.code_sync.outputs.tag_target_sha || steps.get_head_sha.outputs.tag_target_sha || steps.get_sha.outputs.commit_sha }}"
 
           echo "=========================================="
           echo "📦 同步 Releases"
@@ -581,6 +595,7 @@ jobs:
           RELEASES=$(cat /tmp/upstream_releases.json)
 
           SYNCED_COUNT=0
+          FAILED_COUNT=0
           SYNCED_TAGS=""
           while read -r release; do
             TAG_NAME=$(echo "$release" | jq -r '.tag_name')
@@ -614,6 +629,9 @@ jobs:
                 echo "   ⚠️ Tag 推送失败，尝试强制推送..."
                 git push origin "$TAG_NAME" --force 2>&1 || {
                   echo "   ❌ Tag 推送失败，无法继续"
+                  echo "   💡 这通常是因为 tag 指向的 commit 含有 workflow 文件变更"
+                  echo "   💡 解决：确认步骤7已删除上游 workflow，或重跑一次"
+                  FAILED_COUNT=$((FAILED_COUNT + 1))
                   continue
                 }
               fi
@@ -654,6 +672,7 @@ jobs:
                 echo "   ⚠️ 请检查仓库 Settings → Actions → General → Workflow permissions"
                 echo "   ⚠️ 需要选择 'Read and write permissions'"
                 rm -f "$BODY_FILE"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
                 continue
               fi
 
@@ -715,11 +734,18 @@ jobs:
           done < <(echo "$RELEASES" | jq -c '.[]')
 
           echo ""
-          echo "✅ Release 同步完成（成功: $SYNCED_COUNT）"
+          echo "✅ Release 同步完成（成功: $SYNCED_COUNT，失败: $FAILED_COUNT）"
           if [ "$SYNCED_COUNT" -gt 0 ]; then
             echo "sync_success=true" >> $GITHUB_OUTPUT
             # 输出已同步的 tag 列表（空格分隔），供步骤10保护
             echo "synced_tags=$SYNCED_TAGS" >> $GITHUB_OUTPUT
+          fi
+          # 输出失败计数，供步骤12汇总
+          echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+          # 如果全部失败，让步骤9失败（job 状态变红）
+          if [ "$SYNCED_COUNT" -eq 0 ] && [ "$FAILED_COUNT" -gt 0 ]; then
+            echo "❌ 所有 Release 同步均失败，步骤标记为失败"
+            exit 1
           fi
 
       # ============================================
@@ -842,14 +868,17 @@ jobs:
           SKIP_RELEASE="${{ github.event.inputs.skip_release_sync || env.SKIP_RELEASE_SYNC }}"
           RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
           SYNC_SUCCESS="${{ steps.sync_releases.outputs.sync_success }}"
+          FAILED_COUNT="${{ steps.sync_releases.outputs.failed_count }}"
           if [ "$SKIP_RELEASE" == "true" ]; then
             echo "| 📦 Release同步 | 跳过（用户选择） | ⏭️ 跳过 | — |"
           elif [ "$RELEASE_COUNT" == "0" ] || [ -z "$RELEASE_COUNT" ]; then
             echo "| 📦 Release同步 | 检查上游 Release | ⚠️ 无Release | 上游无 Release 或 API 失败 |"
-          elif [ "$SYNC_SUCCESS" == "true" ]; then
+          elif [ "$SYNC_SUCCESS" == "true" ] && [ "$FAILED_COUNT" == "0" ]; then
             echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Release | ✅ 成功 | tag+gh release |"
+          elif [ "$SYNC_SUCCESS" == "true" ] && [ "$FAILED_COUNT" != "0" ]; then
+            echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Release | ⚠️ 部分失败 | 成功+失败=$FAILED_COUNT，查看日志 |"
           else
-            echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Release | ❌ 失败 | 查看日志定位 |"
+            echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Release | ❌ 失败 | 全部失败，查看日志定位 |"
           fi
 
           # 步骤10: 清理旧版
